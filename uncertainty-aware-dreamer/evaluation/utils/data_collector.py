@@ -1,5 +1,4 @@
 import torch
-from typing import Union
 
 from uncertainty_aware_dreamer.ssm_mbrl.mbrl.common.data_collector import DataCollector
 from uncertainty_aware_dreamer.ssm_mbrl.mbrl.common.abstract_policy import AbstractPolicy

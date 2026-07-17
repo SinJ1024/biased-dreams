@@ -29,5 +29,5 @@ The following analyses are supported:
 - `analyze_ood`: Use hard-coded out-of-distribution (OOD) state, analyze model rollouts starting from this state; not available for `cartpole_swingup` environment
 - `analyze_attr`: Analyze attractor behavior of both ID and OOD settings; only possible, if analyze_id and `analyze_ood` where executed before
 - `analyze_rew`: Analyze reward behavior for random rollouts
-- `combined_phys_discr`: Combined analysis of physical discrepancy over all other available runs of same configuration; assumes that `analyze_id` and `analyze_ood` were executed there first
+- `combined_phys_discr`: Combined analysis of proprioceptive discrepancy over all other available runs of same configuration; assumes that `analyze_id` and `analyze_ood` were executed there first
 - `combined_rew_discr`: Combined analysis of reward over all other available runs of the same configuration; assumes that `analyze_rew` were executed there first

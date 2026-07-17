@@ -1,7 +1,8 @@
 import torch
-import faiss
 
 from uncertainty_aware_dreamer.ssm_mbrl.util.stack_util import stack_maybe_nested_dicts
+
+from evaluation.common.decoding import get_decoded_physical_states
 
 
 @torch.no_grad()
@@ -66,7 +67,7 @@ def get_posteriors(data_collector,
 @torch.no_grad()
 def get_priors(data_collector,
                start_model_state,
-               num_rollouts,
+               num_rollouts=1,
                include_first=True,
                sample_model=False,
                pred_actions=None):
@@ -109,8 +110,8 @@ def get_one_step_priors(eval_data_collector, posterior_states, gt_actions, rollo
     
     prior_posterior_states = []
     first_step = {k: v[:, 0] for k, v in posterior_states.items()}
-    if posterior_states["gru_cell_state"].shape[0] == 1:  
-        first_step = eval_data_collector._model.repeat_state(first_step[None], num_rollouts)  
+    if posterior_states["gru_cell_state"].shape[0] == 1 and num_rollouts != 1:
+        first_step = eval_data_collector._model.repeat_state(first_step, num_rollouts) 
     prior_posterior_states.append(first_step)
     
     for t in range(rollout_length - 1):
@@ -127,94 +128,19 @@ def get_one_step_priors(eval_data_collector, posterior_states, gt_actions, rollo
     eval_data_collector._imagine_horizon = prev_imagine_horizon 
 
     return stack_maybe_nested_dicts(prior_posterior_states, dim=1)
-
-
-def get_start_state(data_collector, random=False, step_idx=None):
-    """
-    Determine start state, either random or specifically chosen.
-    If random=False, then:
-    1.  Collect some amount of episodes. From these episodes determine the most extreme state in any dimension.
-    2.  Determine starting latent state from the physical state.
-    """
-    _, actions, _, infos, post_states = data_collector.collect(sample_policy=False, # greedy actions
-                                                               sample_model=False)  # act upon deterministic model states
-
-    # [num_init_episodes x episode_length+1 x #phys_dims]
-    phys_states = torch.stack([info["state"] for info in infos], dim=0)
-    
-    if step_idx is not None:
-        # If step index provied, use random episode, but specific step index
-        assert step_idx < phys_states.shape[1]
-        episode_idx = torch.randint(phys_states.shape[0], (1,)).squeeze(-1)
-    elif random:
-        episode_idx = torch.randint(phys_states.shape[0], (1,)).squeeze(-1)
-        step_idx = torch.randint(phys_states.shape[1], (1,)).squeeze(-1)
-    else:
-        # Determine index of posterior states, that maximizes the physical state in any dimension.
-        valid_phys_states = phys_states[:, 1:]
-        
-        max_dim_indices = torch.argmax(valid_phys_states, dim=-1, keepdim=True)
-        max_dim = torch.take_along_dim(valid_phys_states, max_dim_indices, dim=-1).squeeze(-1)
-        max_step_indices = torch.argmax(max_dim, dim=-1, keepdim=True)
-        max_step = torch.take_along_dim(max_dim, max_step_indices, dim=-1).squeeze(-1)
-        
-        episode_idx = torch.argmax(max_step, dim=-1)
-        step_idx = max_step_indices[episode_idx].item()
-
-    # Start model state is a dictionary coinciding with the keys of post_states.
-    # Entries are tensors of shape [1 x state_dim]
-    start_model_state = {}
-    for key in post_states[0]:
-        start_model_state[key] = post_states[episode_idx][key][step_idx].unsqueeze(0)
-    
-    # Start physical state is the physical state at the determined index, which we want to reset the environment to.
-    # step_idx - 1, since we have a index misalignment due to 0-th obs/info being appended before being associated with the 0-th model state
-    # [1 x #phys_dims]
-    start_phys_state = infos[episode_idx]["state"][step_idx - 1]
-
-    # Get start action.
-    start_action = actions[episode_idx][step_idx].unsqueeze(0)
-
-    return start_model_state, start_phys_state, start_action
-
-
-def get_most_id_state(dataset, frac=1, k=10):
-    """
-    Find state with smallest mean distance to its k-neighbors in the dataset.
-    """
-    num_seq, seq_len, dim = dataset.shape
-    dataset = dataset.flatten(0, 1)
-    
-    # Use only fraction of dataset, since otherwise pairwise comparison takes way too long
-    subset_idx = torch.randperm(num_seq * seq_len)[:int(num_seq * seq_len / frac)]
-    data_subset = dataset[subset_idx]
-    
-    data_np = data_subset.cpu().numpy().astype("float32")
-
-    index = faiss.IndexFlatL2(dim)
-    index.add(data_np)
-    
-    dists, _ = index.search(data_np, k + 1) # k+1 because the first neighbor is the point itself
-
-    mean_knn_dist = dists[:, 1:].mean(axis=1) # omit point itself
-    best_idx = mean_knn_dist.argmin()
-    best_mean_knn_dist = mean_knn_dist.min()
-    best_point = data_subset[best_idx]
-    
-    return best_point, best_mean_knn_dist
     
 
 def get_sequence(data_collector, sequence_length, random=False):
     """
     Collect entire sequence with given sequence length.
     """
-    all_obs, actions, _, infos, post_states = data_collector.collect(sample_policy=False,   # greedy actions
-                                                                     sample_model=False)    # act upon deterministic model states
+    all_obs, actions, rewards, infos, post_states = data_collector.collect(sample_policy=False, # greedy actions
+                                                                           sample_model=False)  # act upon deterministic model states
 
     # [num_init_episodes x episode_length+1 x #phys_dims]
     phys_states = torch.stack([info["state"] for info in infos], dim=0)
     
-    # We can only sample at most the episode length
+    # We can only sample at most the episode length.
     assert phys_states.shape[1] >= sequence_length
     
     if not random:
@@ -232,104 +158,165 @@ def get_sequence(data_collector, sequence_length, random=False):
         episode_idx = torch.randint(phys_states.shape[0], (1,)).squeeze(-1)
         start_idx = torch.randint(1, phys_states.shape[1] - sequence_length - 1, (1,)).squeeze(-1)
     
-    # Sequence slice for model states and actions
+    # Sequence slice for model states and actions.
     seq_slice = slice(start_idx, start_idx + sequence_length)
-    # Sequence slice for observations and physical states, since we have a index misalignment due to 0-th obs/info being appended before being associated with the 0-th model state
+    # Sequence slice for observations and physical states, since we have a index misalignment due to 0-th obs/info being appended before being associated with the 0-th model state.
     seq_slice_shift = slice(start_idx - 1, start_idx - 1 + sequence_length)
 
     # Start model state is a dictionary coinciding with the keys of post_states.
-    # Entries are tensors of shape [1 x state_dim]
-    model_states = {k: post_states[episode_idx][k][seq_slice].squeeze(1) for k in post_states[0]}
+    model_states = {k: post_states[episode_idx][k][seq_slice].unsqueeze(0) for k in post_states[0]}
     
     # Start physical state is the physical state at the determined index, which we want to reset the environment to.
-    # [1 x #phys_dims]
-    phys_states = infos[episode_idx]["state"][seq_slice_shift]
+    phys_states = infos[episode_idx]["state"][seq_slice_shift].unsqueeze(0)
 
-    # Get start action.
-    actions = actions[episode_idx][seq_slice]
+    # Extract actions.
+    actions = actions[episode_idx][seq_slice].unsqueeze(0)
     
-    # Extract observation sequence
-    obs = [all_obs[episode_idx][i][seq_slice_shift] for i in range(len(all_obs[0]))]
+    # Extract observation sequence.
+    obs = [all_obs[episode_idx][i][seq_slice_shift].unsqueeze(0) for i in range(len(all_obs[0]))]
+    
+    # Extract rewards.
+    rewards = rewards[episode_idx][seq_slice_shift].unsqueeze(0)
 
-    return obs, model_states, phys_states, actions
-
-
-def get_posterior_seq(data_collector, rollout_length):
-    """
-    Get one posterior sequence far into the episode.
-    """
-    start_model_state, start_phys_state, _ = get_start_state(data_collector=data_collector,
-                                                             step_idx=200)
-    # Posterior rollout from start conditions
-    post_states, post_phys_states, post_obs, post_act, post_rew = get_posteriors(data_collector=data_collector,
-                                                                                 start_model_state=start_model_state,
-                                                                                 start_phys_state=start_phys_state,
-                                                                                 num_rollouts=1,
-                                                                                 rollout_length=rollout_length)
-    return post_states, post_phys_states, post_obs, post_act, post_rew
+    return obs, model_states, phys_states, actions, rewards
 
 
-def get_random_posteriors_priors(data_collector,
-                                 rollout_length=100,
+def get_random_posteriors_priors(experiment,
+                                 data_collector,
+                                 rollout_length=50,
                                  num_searches=1000,
-                                 verbose=True):
+                                 verbose=False):
     """
     Collect random posterior and prior rollouts. Priors start at a random model state of the previously
     computed posterior rollout for efficiency reasons.
     """
+    def _append_nested(storage, values, squeeze_first=True):
+        for key, val in values.items():
+            if squeeze_first:
+                if isinstance(val, dict):
+                    val = {k: v.squeeze(0) for k, v in val.items()}
+                else:
+                    val = val.squeeze(0)
+            storage[key].append(val)
+                
+    def _stack_nested(storage):
+        for key, val in storage.items():
+            if isinstance(val[0], dict):
+                storage[key] = stack_maybe_nested_dicts(val, dim=0)
+            else:
+                storage[key] = torch.stack(val, dim=0)
+    
+    device = experiment._device
+    
     prev_imagine_horizon = data_collector._imagine_horizon
     prev_seq_per_collect = data_collector._sequences_per_collect
     data_collector._imagine_horizon = rollout_length
     data_collector._sequences_per_collect = 1
     
-    all_post_states,  all_post_act, all_post_start_phys_states = [], [], []
-    all_prior_states, all_prior_act, all_prior_start_phys_states = [], [], []
+    post_infos = {
+        "states": [],
+        "one_step_prior_states": [],
+        "act": [],
+        "start_rew": [],
+        "start_phys": [],
+        "dec_phys": [],
+        "dec_phys_one_step": []
+    }
+    prior_infos = {
+        "closed": {
+            "states": [],
+            "act": [],
+            "start_rew": [],
+            "start_phys": [],
+            "dec_phys": []
+        },
+        "open": {
+            "states": [],
+            "act": [],
+            "start_rew": [],
+            "start_phys": [],
+            "dec_phys": []
+        }
+    }
     for i in range(num_searches):
         # Sample random posterior sequence.
-        _, post_states, post_phys_states, post_act = get_sequence(data_collector=data_collector,
-                                                                  sequence_length=rollout_length,
-                                                                  random=True)
+        _, post_states, post_phys, post_acts, post_rew = get_sequence(data_collector=data_collector,
+                                                                      sequence_length=rollout_length,
+                                                                      random=True)
+        post_start_phys = post_phys[0, 0:1]
+        post_start_rew = post_rew[0, 0:1]
         
-        # Sample random prior sequence, starting from some random posterior state.
-        rand_idx = torch.randint(0, post_phys_states.shape[0], (1,))
-        start_model_state = {k: v[rand_idx, :] for k, v in post_states.items()}
-        start_phys_state = post_phys_states[rand_idx, :]
-        prior_states, prior_acts = get_priors(data_collector=data_collector,
-                                              start_model_state=start_model_state,
-                                              num_rollouts=1,
-                                              sample_model=True)         # act upon sampled model states
+        # Determine corresponding posterior-informed one step priors.
+        one_step_prior_states = get_one_step_priors(eval_data_collector=data_collector,
+                                                    posterior_states=post_states,
+                                                    gt_actions=post_acts,
+                                                    rollout_length=rollout_length,
+                                                    num_rollouts=1,
+                                                    open_loop=False)
         
-        prior_states = {k: v.squeeze(0) for k, v in prior_states.items()}
+        # Rollout random closed-loop prior sequence, starting from some random posterior state.
+        rand_idx = torch.randint(0, post_phys.shape[0], (1,))
+        start_state_closed = {k: v[0, rand_idx] for k, v in post_states.items()}
+        prior_start_phys_closed = post_phys[0, rand_idx]
+        prior_start_rew_closed = post_rew[0, rand_idx]
+        prior_states_closed, prior_acts_closed = get_priors(data_collector=data_collector,
+                                                            start_model_state=start_state_closed,
+                                                            sample_model=True) # act upon sampled model states
         
-        all_post_states.append(post_states)
-        all_post_act.append(post_act)
-        all_post_start_phys_states.append(post_phys_states[0])
+        # Rollout open-loop prior sequence according to posterior action sequence
+        start_state_open = {k: v[0, 0:1] for k, v in post_states.items()}
+        prior_start_phys_open = post_phys[0, 0:1]
+        prior_start_rew_open = post_rew[0, 0:1]
+        prior_states_open, prior_acts_open = get_priors(data_collector,
+                                                       start_model_state=start_state_open,
+                                                       pred_actions=post_acts.to(device),
+                                                       sample_model=True) # act upon sampled model states
         
-        all_prior_states.append(prior_states)
-        all_prior_act.append(prior_acts.squeeze(0))
-        all_prior_start_phys_states.append(start_phys_state[0])
+        # Get reconstructed physical states.
+        post_dec_phys = get_decoded_physical_states(experiment, post_states)
+        one_step_prior_dec_phys = get_decoded_physical_states(experiment, one_step_prior_states)
+        prior_phys_closed = get_decoded_physical_states(experiment, prior_states_closed)
+        prior_phys_open = get_decoded_physical_states(experiment, prior_states_open)
+        
+        _append_nested(post_infos, {
+            "states": post_states,
+            "one_step_prior_states": one_step_prior_states,
+            "act": post_acts,
+            "start_rew": post_start_rew,
+            "start_phys": post_start_phys,
+            "dec_phys": post_dec_phys,
+            "dec_phys_one_step": one_step_prior_dec_phys,
+        }, squeeze_first=True)
+
+        _append_nested(prior_infos["closed"], {
+            "states": prior_states_closed,
+            "act": prior_acts_closed,
+            "start_rew": prior_start_rew_closed,
+            "start_phys": prior_start_phys_closed,
+            "dec_phys": prior_phys_closed,
+        }, squeeze_first=True)
+
+        _append_nested(prior_infos["open"], {
+            "states": prior_states_open,
+            "act": prior_acts_open,
+            "start_rew": prior_start_rew_open,
+            "start_phys": prior_start_phys_open,
+            "dec_phys": prior_phys_open,
+        }, squeeze_first=True)
         
         if verbose:
             print("[COLLECT] Finished", i, "searches.")
         
-    all_post_states = stack_maybe_nested_dicts(all_post_states, dim=0)
-    all_post_act = torch.stack(all_post_act, dim=0)
-    all_post_start_phys_states = torch.stack(all_post_start_phys_states, dim=0)
-    
-    all_prior_states = stack_maybe_nested_dicts(all_prior_states, dim=0)
-    all_prior_act = torch.stack(all_prior_act, dim=0)
-    all_prior_start_phys_states = torch.stack(all_prior_start_phys_states, dim=0)
+    _stack_nested(post_infos)
+    _stack_nested(prior_infos["closed"])
+    _stack_nested(prior_infos["open"])
     
     data_collector._imagine_horizon = prev_imagine_horizon
     data_collector._sequences_per_collect = prev_seq_per_collect
     
     all_dict = {
-        "post_states": all_post_states,
-        "post_act": all_post_act,
-        "post_start_phys_state": all_post_start_phys_states,
-        "prior_states": all_prior_states,
-        "prior_act": all_prior_act,
-        "prior_start_phys_state": all_prior_start_phys_states,
+        "post": post_infos,
+        "prior": prior_infos
     }
     
     return all_dict

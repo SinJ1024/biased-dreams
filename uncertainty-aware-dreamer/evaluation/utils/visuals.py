@@ -12,7 +12,6 @@ def plot_funcs_shared(means: list,
                       colors: list,
                       linestyles: list,
                       linewidths: list,
-                      vline: Optional[int] = None,
                       path: str = "plot",
                       y_label: str = None,
                       title: str = None,
@@ -62,9 +61,6 @@ def plot_funcs_shared(means: list,
         plt.title(title)
         
     plt.margins(x=0)
-        
-    if vline is not None:
-        plt.axvline(x=vline, ymin=0, ymax=100, color="gray", alpha=0.6, linestyle="--", zorder=-100)
     
     plt.tight_layout()
     

@@ -1,6 +1,5 @@
 import torch
 import os
-import json
 import numpy as np
 from typing import Optional
 from sklearn.decomposition import PCA
@@ -8,6 +7,7 @@ import random
 
 from uncertainty_aware_dreamer.ssm_mbrl.common.img_preprocessor import ImgPreprocessor
 from uncertainty_aware_dreamer.envs.env_factory import StateBasedDMCEnvFactory
+from uncertainty_aware_dreamer.ssm_mbrl.util.stack_util import stack_maybe_nested_dicts
 
 from evaluation.utils.data_collector import EvalDataCollector
 from evaluation.utils.saves import save_obs_trajectory, save_to_csv
@@ -15,8 +15,7 @@ from evaluation.utils.visuals import plot_funcs_shared, plot_vector_field_with_l
 
 from evaluation.common.decoding import get_uncertainties, get_reconstructions, get_decoded_physical_states, get_decoded_rewards
 from evaluation.common.env_simulation import get_env_infos_from_actions, get_env_obs_from_phys_states
-from evaluation.common.ood_phys_states import get_hardcoded_ood_state
-from evaluation.common.rollouts import get_posteriors, get_priors, get_one_step_priors, get_most_id_state, get_random_posteriors_priors
+from evaluation.common.rollouts import get_posteriors, get_priors, get_one_step_priors, get_random_posteriors_priors
 
 
 def create_test_env(overrides_config):
@@ -29,18 +28,16 @@ def create_test_env(overrides_config):
 
 def evaluate(experiment,
              overrides_config,
-             warm_up_steps: int = 3,
-             num_init_episodes: int = 10,
-             rollout_length: int = 30,
-             num_rollouts: int = 1000,
-             start_state_path: str = None,
+             num_init_episodes: int = 1,
+             rollout_length: int = 50,
+             num_rollouts: int = 10,
              analyze_id: bool = True,
              analyze_ood: bool = True,
              analyze_attr: bool = True,
              analyze_rew: bool = True,
              combined_phys_discr: bool = True,
              combined_rew_discr: bool = True,
-             open_loop: bool = True):
+             open_loop: bool = False):
     
     # Set seed for reproducibility.
     seed = 42
@@ -59,7 +56,6 @@ def evaluate(experiment,
                                        add_cb_noise=mbrl_config.img_preprocessing.add_cb_noise)
     
     assert rollout_length <= 1000 / env_config.action_repeat, "[ERROR] Rollout length too long."
-    assert warm_up_steps < rollout_length, "[ERROR] Too many warm-up steps."
 
     eval_data_collector = EvalDataCollector(env=test_env,
                                             policy=experiment._policy,
@@ -75,49 +71,30 @@ def evaluate(experiment,
     # Define environment specific state mask.
     mask = test_env.get_translation_inv_mask(transformed=False)[None, None]
     
-    # Load training dataset of physical states.
-    dataset = torch.load(overrides_config.log_dir + "/dataset.pt")
-    states = torch.cat([torch.stack(dataset[k]["states"], dim=0) for k in dataset.keys()], dim=0)
-    
-    args = (eval_data_collector, test_env, experiment, img_preprocessor, rollout_length, num_rollouts, warm_up_steps, open_loop, mask)
+    args = (eval_data_collector, test_env, experiment, img_preprocessor, rollout_length, num_rollouts, open_loop, mask)
     
     ###########################################################################################
     # -------------------------------- ID --------------------------------
     if analyze_id or analyze_attr:
         print("[ID] Starting ID setting...")
         
-        if start_state_path is not None:
-            # Load state from somewhere else.
-            print("[ID] Loading starting state from " + start_state_path + "/id_state.json")
-            with open(start_state_path + "/id_state.json", "r") as f:
-                id_state = json.load(f)
-            most_id_state, most_id_mean_knn_dist = torch.tensor(id_state["state"]), id_state["mean_knn_dist"]
-        else:
-            # Get "most in-distribution" point from the training dataset of physical states.
-            if not os.path.isfile(overrides_config.log_dir + "id_state.json"):
-                print("[ID] ID state not yet found, searching for most ID state...")
-                most_id_state, most_id_mean_knn_dist = get_most_id_state(dataset=states, frac=4, k=100)
-                with open(overrides_config.log_dir + "id_state.json", "w") as out:
-                    json.dump({"state": most_id_state.cpu().numpy().tolist(),
-                               "mean_knn_dist": most_id_mean_knn_dist.item()},
-                              out)
-            else:
-                print("[ID] Load already existing ID state from same directory.")
-                with open(overrides_config.log_dir + "id_state.json", "r") as f:
-                    id_state = json.load(f)
-                most_id_state, most_id_mean_knn_dist = torch.tensor(id_state["state"]), id_state["mean_knn_dist"]
-        
         dump_dir = eval_dir + "/id"
         if not os.path.isdir(dump_dir):
             os.makedirs(dump_dir)
             
-        id_post_infos, id_prior_infos = analyze_from_starting_state(*args,
-                                                                    start_state=most_id_state,
-                                                                    start_model_state=None,
-                                                                    eval_dir=dump_dir)
-        id_post_infos["start_phys_state"] = most_id_state
-        id_prior_infos["start_phys_state"] = most_id_state
+         # Get model states and decoded physical states corresponding to the most model-confident state embedding.
+        id_model_states, id_phys_states = get_topk_states(experiment,
+                                                          eval_data_collector,
+                                                          rollout_length=rollout_length,
+                                                          k=10,
+                                                          largest=False,
+                                                          path_to_rollouts=overrides_config.log_dir+"random_rollouts.pt")
         
+        id_post_infos, id_prior_infos = analyze_physical_discrepancy(*args,
+                                                                     start_phys_states=id_phys_states,
+                                                                     start_model_states=id_model_states,
+                                                                     eval_dir=dump_dir)
+
         torch.save(id_post_infos, overrides_config.log_dir + "id_post_infos.pt")
         torch.save(id_prior_infos, overrides_config.log_dir + "id_prior_infos.pt")
     else:
@@ -127,28 +104,25 @@ def evaluate(experiment,
     if analyze_ood:
         print("[OOD] Starting OOD setting...")
         
-        ood_phys_state = get_hardcoded_ood_state(env_name=overrides_config.environment.env.env)
-            
-        if ood_phys_state is not None:
-            ood_phys_state = test_env.transform_phys_state(ood_phys_state)
+        dump_dir = eval_dir + "/ood"
+        if not os.path.isdir(dump_dir):
+            os.makedirs(dump_dir)
         
-            dump_dir = eval_dir + "/ood"
-            if not os.path.isdir(dump_dir):
-                os.makedirs(dump_dir)
-                
-            ood_post_infos, ood_prior_infos  = analyze_from_starting_state(*args,
-                                                                           start_state=ood_phys_state,
-                                                                           start_model_state=None,
-                                                                           eval_dir=dump_dir)
+        # Get model states decoded physical states corresponding to the least model-confident state embedding.
+        ood_model_states, ood_phys_states = get_topk_states(experiment,
+                                                            eval_data_collector,
+                                                            rollout_length=rollout_length,
+                                                            k=10,
+                                                            largest=True,
+                                                            path_to_rollouts=overrides_config.log_dir+"random_rollouts.pt")
             
-            ood_post_infos["start_phys_state"] = ood_phys_state
-            ood_prior_infos["start_phys_state"] = ood_phys_state
-            
-            torch.save(ood_post_infos, overrides_config.log_dir + "ood_post_infos.pt")
-            torch.save(ood_prior_infos, overrides_config.log_dir + "ood_prior_infos.pt")
-        else:
-            print("[OOD] Skip, since hardcoded OOD state not defined.")
-            ood_post_infos, ood_prior_infos = None, None
+        ood_post_infos, ood_prior_infos = analyze_physical_discrepancy(*args,
+                                                                       start_phys_states=ood_phys_states,
+                                                                       start_model_states=ood_model_states,
+                                                                       eval_dir=dump_dir)
+        
+        torch.save(ood_post_infos, overrides_config.log_dir + "ood_post_infos.pt")
+        torch.save(ood_prior_infos, overrides_config.log_dir + "ood_prior_infos.pt")
     else:
         ood_post_infos, ood_prior_infos = None, None
     
@@ -160,17 +134,25 @@ def evaluate(experiment,
         if not os.path.isdir(dump_dir):
             os.makedirs(dump_dir)
         
-        # Sequences to be plotted.
-        id_seq = {k: v[0:1] for k, v in id_post_infos["states"].items()}
-        ood_seq = {k: v[0:1] for k, v in ood_post_infos["states"].items()} if ood_post_infos is not None else None
-        seqs = [id_seq, ood_seq] if ood_post_infos is not None else [id_seq]
+        try:
+            id_post_infos = torch.load(overrides_config.log_dir + "id_post_infos.pt")
+            id_prior_infos = torch.load(overrides_config.log_dir + "id_prior_infos.pt")
+            ood_post_infos = torch.load(overrides_config.log_dir + "ood_post_infos.pt")
+            ood_prior_infos = torch.load(overrides_config.log_dir + "ood_prior_infos.pt")
+        except:
+            print("--- Analyze the ID and OOD phys. discrepancy before starting the attractor analysis!")
+        
+        # Select most model-certain/model-uncertain sequences for analysis.
+        id_seq = get_top1_from_infos_dict(id_post_infos, id_prior_infos, largest=False)
+        ood_seq = get_top1_from_infos_dict(ood_post_infos, ood_prior_infos, largest=True)
+        seqs = [id_seq, ood_seq]
         
         analyze_attractor(experiment=experiment,
                           data_collector=eval_data_collector,
-                          sequences=seqs,
-                          warm_up_steps=warm_up_steps,
                           rollout_length=rollout_length,
-                          dir=dump_dir)
+                          sequences=seqs,
+                          path_to_rollouts=overrides_config.log_dir+"random_rollouts.pt",
+                          path_to_attr=dump_dir)
     
     # -------------------------------- REWARDS --------------------------------
     if analyze_rew:
@@ -180,18 +162,17 @@ def evaluate(experiment,
         if not os.path.isdir(dump_dir):
             os.makedirs(dump_dir)
             
-        analyze_reward(experiment=experiment,
-                       data_collector=eval_data_collector,
+        analyze_reward(data_collector=eval_data_collector,
+                       experiment=experiment,
                        rollout_length=rollout_length,
-                       warm_up_steps=warm_up_steps,
-                       dir=dump_dir)
+                       path_to_rollouts=overrides_config.log_dir+"random_rollouts.pt",
+                       path_to_rew=dump_dir)
     
     # -------------------------------- COMBINED --------------------------------
     if combined_phys_discr:
         print("[COMB] Starting combined rewards analysis...")
         
-        versions = ["id", "ood"] if not overrides_config.environment.env.env == "cartpole_swingup" else ["id"]
-        for ver in versions:
+        for ver in ["id", "ood"]:
             dump_dir = eval_dir + "/combined_" + ver
             if not os.path.isdir(dump_dir):
                 os.makedirs(dump_dir)
@@ -220,7 +201,6 @@ def evaluate(experiment,
             
             compute_phys_diff(env=test_env,
                               mask=mask,
-                              warm_up_steps=warm_up_steps,
                               phys_states=phys_states,
                               comp_phys_states=comp_phys_states,
                               uncertainties=uncertainties,
@@ -253,16 +233,66 @@ def evaluate(experiment,
         rewards = [torch.cat(post_rewards, 0), torch.cat(prior_rewards, 0)]
         comp_rewards = [torch.cat(post_comp_rewards, 0), torch.cat(prior_comp_rewards, 0)]
         
-        compute_rew_diff(warm_up_steps=warm_up_steps,
-                         rewards=rewards,
+        compute_rew_diff(rewards=rewards,
                          comp_rewards=comp_rewards,
                          name="reward_diff_combined",
                          dir=dump_dir)
 
 
+def get_topk_states(experiment, data_collector, rollout_length, k=10, largest=False, path_to_rollouts="/."):
+    """
+    Returns k physical states corresponding to the most/least model-confident state embeddings from randomly collected rollouts.
+    """
+    device = experiment._device
+    
+    # Collect or load random rollouts.
+    random_rollouts = get_random_rollouts(experiment=experiment,
+                                          data_collector=data_collector,
+                                          rollout_length=rollout_length,
+                                          path_to_rollouts=path_to_rollouts)
+
+    # Use closed-loop prior states for most model-confident version and open-loop prior states for least model-confident version.
+    prior_key_suff = "closed" if not largest else "open"
+    
+    post_states = random_rollouts["post"]["one_step_prior_states"]
+    prior_states = random_rollouts["prior"][prior_key_suff]["states"]
+    states = {k: torch.cat((post_states[k].to(device), prior_states[k].to(device)), 0) for k in post_states.keys()}
+    
+    post_act = random_rollouts["post"]["act"]
+    prior_act = random_rollouts["prior"][prior_key_suff]["act"]
+    actions = torch.cat((post_act.to(device), prior_act.to(device)), 0)
+    
+    post_dec_phys = random_rollouts["post"]["dec_phys"]
+    prior_dec_phys = random_rollouts["prior"][prior_key_suff]["dec_phys"]
+    dec_phys = torch.cat((post_dec_phys.to(device), prior_dec_phys.to(device)), 0)
+    
+    # Compute uncertainties.
+    unc = get_uncertainties(experiment=experiment,
+                            states=states,
+                            actions=actions,
+                            rollout_length=rollout_length)
+    
+    # Find model and physical states corresponding to most/least model-confident state embeddings.
+    idx = torch.topk(unc.flatten(), k=k, largest=largest).indices
+    
+    topk_states = {k: v[torch.unravel_index(idx, unc.shape[:-1])] for k, v in states.items()}
+    topk_dec_phys = dec_phys[torch.unravel_index(idx, unc.shape[:-1])]
+    
+    return topk_states, topk_dec_phys
+
+
+def get_top1_from_infos_dict(post_infos, prior_infos, largest=False):
+    """
+    Find sequence with highest/lowest mean uncertainty over time.
+    """
+    states_seqs = {k: torch.cat((post_infos["states"][k], prior_infos["states"][k]), 0) for k in post_infos["states"].keys()}
+    seqs_unc = torch.cat((post_infos["unc"].mean(1), prior_infos["unc"].mean(1)), 0)
+    idx = torch.argmax(seqs_unc.squeeze(-1)) if largest else torch.argmin(seqs_unc.squeeze(-1))
+    return {k: v[idx:idx+1] for k, v in states_seqs.items()}
+
+
 def compute_phys_diff(env,
                       mask,
-                      warm_up_steps,
                       gt_phys_states: Optional[torch.Tensor] = None,
                       phys_states: list[torch.Tensor] = [],
                       comp_phys_states: list[torch.Tensor] = [],
@@ -303,7 +333,7 @@ def compute_phys_diff(env,
                 dim_diff = abs(phys_states[i][..., dim] - comp_phys_states[i][..., dim])
             diff.append(dim_diff)
         # diff = [dims, num_seq, seq_len]
-        dists = torch.sqrt(torch.tensor(np.array(diff)).mean(0))
+        dists = torch.tensor(np.array(diff)).mean(0)
         diffs.append(dists) 
     
     diff_means = [d.mean(0) for d in diffs]
@@ -321,7 +351,6 @@ def compute_phys_diff(env,
                       colors=colors[1:],
                       linestyles=["-"] * (len(phys_states) + 1),
                       linewidths=[2] * (len(phys_states) + 1),
-                      vline=warm_up_steps-1,
                       y_lim=[0, 3],
                       y_lim2=[0, 10] if uncertainties is not None else None,
                       y_axis_2=2 if uncertainties is not None else None,
@@ -341,7 +370,6 @@ def compute_phys_diff(env,
                           colors=colors[:-1],
                           linestyles=["--"] + ["-"] * len(phys_states),
                           linewidths=[5, 2, 2],
-                          vline=warm_up_steps-1,
                           title="Development of Masked Phys. State",
                           path=dir + "/" + dev_name)
     
@@ -359,8 +387,7 @@ def compute_phys_diff(env,
     return diffs
 
 
-def compute_rew_diff(warm_up_steps,
-                     rewards: list[torch.Tensor] = [],
+def compute_rew_diff(rewards: list[torch.Tensor] = [],
                      comp_rewards: list[torch.Tensor] = [],
                      rewards_labels: list[str] = ["Posterior", "Prior"],
                      colors: list[str] = ["royalblue", "darkorange"],
@@ -379,7 +406,6 @@ def compute_rew_diff(warm_up_steps,
                       colors=colors,
                       linestyles=["-"] * len(rewards),
                       linewidths=[2] * len(rewards),
-                      vline=warm_up_steps-1,
                       y_lim=[-1.5, 1.5],
                       title="Development of Reward Difference",
                       path=dir + "/" + name)     
@@ -453,20 +479,18 @@ def dump_obs_and_videos(data_collector,
                         img_preprocessor=img_preprocessor)
 
 
-def get_random_rollouts(data_collector,
-                        warm_up_steps,
-                        rollout_length=100,
+def get_random_rollouts(experiment,
+                        data_collector,
+                        rollout_length=50,
                         num_searches=1000,
-                        dir="/."):
+                        path_to_rollouts="/."):
     """
     Either collect a set of random posterior and prior rollouts or load already collected set.
     """
-    
-    
-    path_to_rollouts = dir + "/../../random_model_rollouts_100.pt"
     if not os.path.isfile(path_to_rollouts):
-        random_model_rollouts = get_random_posteriors_priors(data_collector,
-                                                             rollout_length=rollout_length+warm_up_steps,
+        random_model_rollouts = get_random_posteriors_priors(experiment,
+                                                             data_collector,
+                                                             rollout_length=rollout_length,
                                                              num_searches=num_searches)
         torch.save(random_model_rollouts, path_to_rollouts)
     else:
@@ -475,129 +499,166 @@ def get_random_rollouts(data_collector,
     return random_model_rollouts
 
 
-def analyze_from_starting_state(data_collector,
-                                env,
-                                experiment,
-                                img_preprocessor,
-                                rollout_length,
-                                num_rollouts,
-                                warm_up_steps,
-                                open_loop,
-                                mask,
-                                start_state,
-                                start_model_state,
-                                eval_dir):
+def analyze_physical_discrepancy(data_collector,
+                                 env,
+                                 experiment,
+                                 img_preprocessor,
+                                 rollout_length,
+                                 num_rollouts,
+                                 open_loop,
+                                 mask,
+                                 start_phys_states,
+                                 start_model_states,
+                                 eval_dir):
+    
+    num_start_states = start_phys_states.shape[0]
     
     # ............ POSTERIOR ............
-    # Posterior rollouts have sequence length rollout_length + warm_up_steps for a fair comparison to prior rollouts.
-    # Compute one "gt" posterior rollout.
-    start_phys_state = start_state
-    gt_post_states, gt_post_phys_states, gt_post_obs, gt_post_act, gt_post_rew = get_posteriors(data_collector=data_collector,
-                                                                                                start_model_state=start_model_state,
-                                                                                                start_phys_state=start_phys_state,
-                                                                                                num_rollouts=num_rollouts,
-                                                                                                rollout_length=rollout_length + warm_up_steps + 1,
-                                                                                                pred_actions=None,
-                                                                                                sample_model=True)
+    gt_post_states, gt_post_phys_states, gt_post_obs, gt_post_act = [], [], [], []
+    post_states, post_phys_states, post_comp_phys_states, post_uncertainties = [], [], [], []
+    for i in range(num_start_states):
+        # Rollout each individual of the num_rollouts posterior rollouts.
+        start_model_state = None if start_model_states is None else {k: v[i:i+1] for k, v in start_model_states.items()}
+        start_phys_state = start_phys_states[i].cpu()
+        gt_states, gt_phys, gt_obs, gt_act, _ = get_posteriors(data_collector=data_collector,
+                                                               start_model_state=start_model_state,
+                                                               start_phys_state=start_phys_state,
+                                                               num_rollouts=num_rollouts,
+                                                               rollout_length=rollout_length + 1,
+                                                               pred_actions=None,
+                                                               sample_model=True)
+        
+        # Compensate offset between environment info (obs, physical states) and model outputs (posterior states, actions).
+        gt_states = {k: v[:, 1:] for k, v in gt_states.items()}
+        gt_phys = gt_phys[:, :-1]
+        gt_obs = [o[:, :-1] for o in gt_obs]
+        gt_act = gt_act[:, 1:]
+        
+        # Compute one one-step priors (with posterior background), which is the state before updated with the current observation.
+        states = get_one_step_priors(eval_data_collector=data_collector,
+                                     posterior_states=gt_states,
+                                     gt_actions=gt_act,
+                                     rollout_length=rollout_length,
+                                     num_rollouts=1,
+                                     open_loop=open_loop)
+        
+        # Get "baseline" decoder physical states from posterior rollouts.
+        phys = get_decoded_physical_states(experiment, states)
+        
+        # Get corresponding uncertainties.
+        unc = get_uncertainties(experiment=experiment,
+                                states=states,
+                                actions=gt_act.to(experiment._device),
+                                rollout_length=rollout_length)
+        
+        # Get comparison physical states for posterior ones.
+        comp_phys = gt_phys.to(phys.device)
+        
+        gt_post_states.append(gt_states)
+        gt_post_phys_states.append(gt_phys)
+        gt_post_obs.append(gt_obs)
+        gt_post_act.append(gt_act)
+        
+        post_states.append(states)
+        post_phys_states.append(phys)
+        post_comp_phys_states.append(comp_phys)
+        post_uncertainties.append(unc)
+            
+    # Create flatten version of lists.
+    comb_post_states = stack_maybe_nested_dicts(post_states, 0)
+    comb_post_states = {k: v.flatten(0, 1) for k, v in comb_post_states.items()}
+    comb_gt_post_act = torch.stack(gt_post_act, 0).flatten(0, 1)
     
-    # Compensate offset between environment info (obs, physical states) and model outputs (posterior states, actions).
-    gt_post_states = {k: v[:, 1:] for k, v in gt_post_states.items()}
-    gt_post_phys_states = gt_post_phys_states[:, :-1]
-    gt_post_obs = [o[:, :-1] for o in gt_post_obs]
-    gt_post_act = gt_post_act[:, 1:]
-    
-    # Compute one one-step priors (with posterior background), which is the state before updated with the current observation.
-    post_states = get_one_step_priors(eval_data_collector=data_collector,
-                                      posterior_states=gt_post_states,
-                                      gt_actions=gt_post_act,
-                                      rollout_length=rollout_length + warm_up_steps,
-                                      num_rollouts=1,
-                                      open_loop=open_loop)
-    
-    # Get "baseline" decoder physical states from posterior rollouts.
-    post_phys_states = get_decoded_physical_states(experiment, post_states)
-    
-    # Get comparison physical states for posterior ones.
-    post_comp_phys_states = gt_post_phys_states.to(post_phys_states.device)
+    comb_gt_post_phys_states = torch.stack(gt_post_phys_states, 0).flatten(0, 1)
+    comb_post_phys_states = torch.stack(post_phys_states, 0).flatten(0, 1)
+    comb_post_comp_phys_states = torch.stack(post_comp_phys_states, 0).flatten(0, 1)
+    comb_post_uncertainties = torch.stack(post_uncertainties, 0).flatten(0, 1)
     
     # ............ PRIOR ............
-    # Start prior rollouts with a fixed amount of warm-up steps to properly initialize model state before imagination.
-    start_model_state = {k: v[0, warm_up_steps+1].unsqueeze(0) for k, v in gt_post_states.items()}
-    prior_states, prior_act = get_priors(data_collector=data_collector,
-                                         pred_actions=gt_post_act[0, warm_up_steps:].unsqueeze(0) if open_loop else None,
-                                         start_model_state=start_model_state,
-                                         num_rollouts=num_rollouts,
-                                         sample_model=True)         # act upon sampled model states
-
-    # Pad first steps with posterior samples for easier visualization.
-    post_pad = {k: v[:, :warm_up_steps] for k, v in post_states.items()}
-    prior_states = {k: torch.cat((post_pad[k], v), 1) for k, v in prior_states.items()}
-    gt_post_act_pad = gt_post_act[:, :warm_up_steps].to(prior_act.device)
-    prior_act = torch.cat((gt_post_act_pad, prior_act), 1)
-    
-    # Get "predicted" decoder physical states from prior rollouts.
-    prior_phys_states = get_decoded_physical_states(experiment, prior_states)
+    prior_states, prior_act, prior_phys_states, prior_comp_phys_states, prior_uncertainties = [], [], [], [], []
+    for i in range(num_start_states):
+        # Start prior rollouts with a fixed amount of warm-up steps to properly initialize model state before imagination.
+        start_model_state = {k: v[0, 0].unsqueeze(0) for k, v in gt_post_states[i].items()}
+        states, act = get_priors(data_collector=data_collector,
+                                 pred_actions=gt_post_act[i][0].unsqueeze(0) if open_loop else None,
+                                 start_model_state=start_model_state,
+                                 num_rollouts=num_rollouts,
+                                 sample_model=True) # act upon sampled model states
         
-    # Get prior gt physical states and rewards to compare to by simulating the environment with given prior actions.
-    _, _, prior_comp_phys_states = get_env_infos_from_actions(data_collector=data_collector,
-                                                              actions=prior_act,
-                                                              start_phys_state=start_phys_state,
-                                                              phys_state_is_obs=False)
-    prior_comp_phys_states = prior_comp_phys_states.to(prior_phys_states.device)
+        # Get "predicted" decoder physical states from prior rollouts.
+        phys = get_decoded_physical_states(experiment, states)
+        
+        # Get corresponding uncertainties.
+        unc = get_uncertainties(experiment=experiment,
+                                states=states,
+                                actions=act,
+                                rollout_length=rollout_length)
+        
+        # Get prior gt physical states and rewards to compare to by simulating the environment with given prior actions.
+        _, _, comp_phys = get_env_infos_from_actions(data_collector=data_collector,
+                                                     actions=act,
+                                                     start_phys_state=start_phys_states[i].cpu(),
+                                                     phys_state_is_obs=False)
+        comp_phys = comp_phys.to(phys.device)
+
+        prior_states.append(states)
+        prior_act.append(act)
+        prior_phys_states.append(phys)
+        prior_comp_phys_states.append(comp_phys)
+        prior_uncertainties.append(unc)
     
-    # ............ UNCERTAINTY ............
-    # Compute prior uncertainties, if applicable.
-    if experiment._ensemble is not None:
-        prior_uncertainties = get_uncertainties(experiment=experiment,
-                                                states=prior_states,
-                                                actions=prior_act,
-                                                rollout_length=rollout_length)
-    else:
-        prior_uncertainties = None
+    # Create flatten version of lists.
+    comb_prior_states = stack_maybe_nested_dicts(prior_states, 0)
+    comb_prior_states = {k: v.flatten(0, 1) for k, v in comb_prior_states.items()}
+    comb_prior_act = torch.stack(prior_act, 0).flatten(0, 1) 
     
+    comb_prior_phys_states = torch.stack(prior_phys_states, 0).flatten(0, 1)
+    comb_prior_comp_phys_states = torch.stack(prior_comp_phys_states, 0).flatten(0, 1)
+    comb_prior_uncertainties = torch.stack(prior_uncertainties, 0).flatten(0, 1)
+        
     # ............ PLOTS ............
     # Plot discrepancies.
     _ = compute_phys_diff(env=env,
                           mask=mask,
-                          warm_up_steps=warm_up_steps,
-                          gt_phys_states=gt_post_phys_states.squeeze(0),
-                          phys_states=[post_phys_states, prior_phys_states],
-                          comp_phys_states=[post_comp_phys_states, prior_comp_phys_states],
-                          uncertainties=prior_uncertainties,
+                          gt_phys_states=comb_gt_post_phys_states,
+                          phys_states=[comb_post_phys_states, comb_prior_phys_states],
+                          comp_phys_states=[comb_post_comp_phys_states, comb_prior_comp_phys_states],
+                          uncertainties=comb_prior_uncertainties,
                           dir=eval_dir)
     
     # Render observations and videos.
     # priors
-    idx = 0
-    prior_states_seq_max = {k: v[idx].unsqueeze(0) for k, v in prior_states.items()}
-    prior_phys_seq_max = env.untransform_phys_state(prior_phys_states[idx]).cpu() * mask
-    prior_act_phys_seq_max = env.untransform_phys_state(prior_comp_phys_states[idx]).cpu() * mask
+    start_idx, seq_idx = 0, 0 # arbitrary choice
+    prior_states_seq = {k: v[seq_idx].unsqueeze(0) for k, v in prior_states[start_idx].items()}
+    prior_phys_seq = env.untransform_phys_state(prior_phys_states[start_idx][seq_idx]).cpu() * mask
+    prior_act_phys_seq = env.untransform_phys_state(prior_comp_phys_states[start_idx][seq_idx]).cpu() * mask
     # post
-    post_states_seq = {k: v[idx].unsqueeze(0) for k, v in prior_states.items()}
-    post_phys_seq = env.untransform_phys_state(post_phys_states[idx]).cpu() * mask
+    post_states_seq = {k: v[seq_idx].unsqueeze(0) for k, v in post_states[start_idx].items()}
+    post_phys_seq = env.untransform_phys_state(post_phys_states[start_idx][seq_idx]).cpu() * mask
     dump_obs_and_videos(data_collector=data_collector, 
                         img_preprocessor=img_preprocessor,
                         experiment=experiment,
-                        gt_obs_seq=gt_post_obs[0][idx],
-                        prior_state_seq=prior_states_seq_max,
-                        prior_recon_phys_seq=prior_phys_seq_max,
-                        prior_act_phys_seq=prior_act_phys_seq_max,
+                        gt_obs_seq=gt_post_obs[start_idx][0][seq_idx],
+                        prior_state_seq=prior_states_seq,
+                        prior_recon_phys_seq=prior_phys_seq,
+                        prior_act_phys_seq=prior_act_phys_seq,
                         post_state_seq=post_states_seq,
                         post_phys_seq=post_phys_seq,
                         dir=eval_dir)
     
     post_infos = {
-        "states": post_states,
-        "act": gt_post_act,
-        "dec_phys_states": post_phys_states,
-        "gt_phys_states": post_comp_phys_states
+        "states": comb_post_states,
+        "act": comb_gt_post_act,
+        "dec_phys_states": comb_post_phys_states,
+        "gt_phys_states": comb_post_comp_phys_states,
+        "unc": comb_post_uncertainties
     }
     prior_infos = {
-        "states": prior_states,
-        "act": prior_act,
-        "dec_phys_states": prior_phys_states,
-        "gt_phys_states": prior_comp_phys_states,
-        "unc": prior_uncertainties
+        "states": comb_prior_states,
+        "act": comb_prior_act,
+        "dec_phys_states": comb_prior_phys_states,
+        "gt_phys_states": comb_prior_comp_phys_states,
+        "unc": comb_prior_uncertainties
     }
     
     return post_infos, prior_infos
@@ -605,22 +666,19 @@ def analyze_from_starting_state(data_collector,
 
 def analyze_attractor(experiment,
                       data_collector,
+                      rollout_length,
                       sequences,
-                      warm_up_steps,
-                      rollout_length=None,
-                      dir="/."):
+                      path_to_rollouts="/.",
+                      path_to_attr="/."):
     
-    random_model_rollouts = get_random_rollouts(data_collector=data_collector,
-                                                warm_up_steps=warm_up_steps,
-                                                dir=dir)
+    # Collect or load random model rollouts.
+    random_rollouts = get_random_rollouts(experiment=experiment,
+                                          data_collector=data_collector,
+                                          rollout_length=rollout_length,
+                                          path_to_rollouts=path_to_rollouts)
     
-    post_states, prior_states = random_model_rollouts["post_states"], random_model_rollouts["prior_states"]
-    
-    # Use specified rollout length, if defined.
-    if rollout_length is not None:
-        post_states = {k: v[:, :rollout_length+warm_up_steps] for k, v in post_states.items()}
-        prior_states = {k: v[:, :rollout_length+warm_up_steps] for k, v in prior_states.items()}
-        sequences = [{k: v[:, :rollout_length+warm_up_steps] for k, v in seq.items()} for seq in sequences]
+    post_states = random_rollouts["post"]["one_step_prior_states"]
+    prior_states = random_rollouts["prior"]["closed"]["states"]
     
     num_seq, seq_len = experiment._model.get_deterministic_features(post_states).shape[:2]
     
@@ -671,7 +729,7 @@ def analyze_attractor(experiment,
                                  n_bins=20,
                                  min_bin_count=1,
                                  num_plots=2,
-                                 path=dir,
+                                 path=path_to_attr,
                                  colorbar=True,
                                  figname="pca_plot")
     
@@ -679,23 +737,24 @@ def analyze_attractor(experiment,
 def analyze_reward(experiment,
                    data_collector,
                    rollout_length,
-                   warm_up_steps,
-                   dir="/."):
+                   path_to_rollouts="/.",
+                   path_to_rew="/."):
     
-    random_model_rollouts = get_random_rollouts(data_collector=data_collector,
-                                                warm_up_steps=warm_up_steps,
-                                                dir=dir)
+    # Collect or load random model rollouts.
+    random_rollouts = get_random_rollouts(experiment=experiment,
+                                          data_collector=data_collector,
+                                          rollout_length=rollout_length,
+                                          path_to_rollouts=path_to_rollouts)
         
-    post_states, post_act, post_start_phys_state = random_model_rollouts["post_states"], random_model_rollouts["post_act"], random_model_rollouts["post_start_phys_state"]
-    prior_states, prior_act, prior_start_phys_state = random_model_rollouts["prior_states"], random_model_rollouts["prior_act"], random_model_rollouts["prior_start_phys_state"]
+    post_states = random_rollouts["post"]["one_step_prior_states"]
+    post_act = random_rollouts["post"]["act"]
+    post_start_phys_state = random_rollouts["post"]["start_phys"]
+    post_start_reward = random_rollouts["post"]["start_rew"]
     
-    assert rollout_length+warm_up_steps <= post_states["gru_cell_state"].shape[1]
-    
-    post_states = {k: v[:, :rollout_length+warm_up_steps] for k, v in post_states.items()}
-    post_act = post_act[:, :rollout_length+warm_up_steps]
-    
-    prior_states = {k: v[:, :rollout_length+warm_up_steps] for k, v in prior_states.items()}
-    prior_act = prior_act[:, :rollout_length+warm_up_steps]
+    prior_states = random_rollouts["prior"]["closed"]["states"]
+    prior_act = random_rollouts["prior"]["closed"]["act"]
+    prior_start_phys_state = random_rollouts["prior"]["closed"]["start_phys"]
+    prior_start_reward = random_rollouts["prior"]["closed"]["start_rew"]
     
     # ............ POSTERIOR ............
     post_decoded_rew = get_decoded_rewards(experiment, post_states)
@@ -703,6 +762,7 @@ def analyze_reward(experiment,
                                                    actions=post_act,
                                                    start_phys_state=post_start_phys_state,
                                                    phys_state_is_obs=False)
+    post_gt_rew[:, 0:1] = post_start_reward.unsqueeze(2)
     
     # ............ PRIOR ............
     prior_decoded_rew = get_decoded_rewards(experiment, prior_states)
@@ -710,6 +770,7 @@ def analyze_reward(experiment,
                                                     actions=prior_act,
                                                     start_phys_state=prior_start_phys_state,
                                                     phys_state_is_obs=False)
+    prior_gt_rew[:, 0:1] = prior_start_reward.unsqueeze(1)
     
     reward_infos = {
         "post_dec_reward": post_decoded_rew,
@@ -717,9 +778,8 @@ def analyze_reward(experiment,
         "prior_dec_reward": prior_decoded_rew,
         "prior_gt_reward": prior_gt_rew
     }
-    torch.save(reward_infos, dir + "/../../reward_infos.pt")
+    torch.save(reward_infos, path_to_rew + "/../../reward_infos.pt")
     
-    compute_rew_diff(warm_up_steps=warm_up_steps,
-                     rewards=[post_decoded_rew.cpu(), prior_decoded_rew.cpu()],
+    compute_rew_diff(rewards=[post_decoded_rew.cpu(), prior_decoded_rew.cpu()],
                      comp_rewards=[post_gt_rew.cpu(), prior_gt_rew.cpu()],
-                     dir=dir)
+                     dir=path_to_rew)

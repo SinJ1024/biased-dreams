@@ -31,11 +31,9 @@ def main(args):
     # Evaluate.
     evaluate(experiment=experiment,
              overrides_config=config,
-             warm_up_steps=args.warm_up_steps,
              num_init_episodes=args.num_init_episodes,
              rollout_length=args.rollout_length,
              num_rollouts=args.num_rollouts,
-             start_state_path=args.start_state_path,
              analyze_id=args.analyze_id,
              analyze_ood=args.analyze_ood,
              analyze_attr=args.analyze_attr,
@@ -52,11 +50,9 @@ if __name__ == "__main__":
     parser.add_argument("--config_path", default="out/test-run/li-rssm/cheetah_run/0")
     parser.add_argument("--config_name", default="config")
     
-    parser.add_argument("--warm_up_steps", type=int, default=3)
     parser.add_argument("--num_init_episodes", type=int, default=1)
     parser.add_argument("--rollout_length", type=int, default=50)
-    parser.add_argument("--num_rollouts", type=int, default=100)
-    parser.add_argument("--start_state_path", type=str, default=None)
+    parser.add_argument("--num_rollouts", type=int, default=10)
     
     parser.add_argument("--analyze_id", type=bool, default=True)
     parser.add_argument("--analyze_ood", type=bool, default=True)

@@ -16,8 +16,6 @@ dependencies:
   - dm-env=1.6=pyhd8ed1ab_1
   - dm-tree=0.1.10=py312hecca40a_0
   - etils=1.12.2=pyhd8ed1ab_0
-  - faiss=1.9.0=py312cuda118h19f20af_0_cuda
-  - faiss-gpu=1.9.0=h418687c_0
   - fsspec=2026.4.0=pyhd8ed1ab_0
   - glfw=3.4=hb03c661_1
   - h2=4.3.0=pyhcf101f3_0
@@ -34,7 +32,6 @@ dependencies:
   - libcblas=3.11.0=6_h0358290_openblas
   - libccd-double=2.1=h59595ed_3
   - libexpat=2.8.0=hecca717_0
-  - libfaiss=1.9.0=cuda118hf323835_0_cuda
   - libffi=3.5.2=h3435931_0
   - libgcc=15.2.0=he0feb66_18
   - libgcc-ng=15.2.0=h69a702a_18
