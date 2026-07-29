@@ -13,7 +13,8 @@ To cite our work, please use the following BibTeX entry:
 @article{berger2026biaseddreams,
     title={{Biased Dreams: Limitations to Epistemic Uncertainty Quantification in Latent Space Models}},
     author={Julia Berger and Bernd Frauenknecht and Sebastian Trimpe and Bastian Leibe},
-    journal={arXiv preprint arXiv:2604.25416},
-    year={2026}
+    journal={Reinforcement Learning Journal},
+    year={2026},
+    note={Presented at the Reinforcement Learning Conference (RLC 2026)}
 }
 ```
