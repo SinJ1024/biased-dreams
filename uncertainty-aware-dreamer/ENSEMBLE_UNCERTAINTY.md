@@ -2,6 +2,8 @@
 
 This guide describes training overrides, metric definitions, checkpoint
 compatibility, fixed-input plotting, and a separate CVaR risk analysis.
+For immutable cross-metric scoring of existing prior caches, see
+[CACHED_COMPARISON.md](CACHED_COMPARISON.md).
 The implementation is local to uncertainty-aware-dreamer; infoprop remains
 independent and unchanged.
 

@@ -42,12 +42,15 @@ def predict_fixed_input(ensemble, state, action):
 
 
 def plot_fixed_input(ensemble, state, action, output_prefix, dimensions=(0, 1),
-                     surface=False, grid_size=180, standard_deviations=4.0):
+                     surface=False, grid_size=180, standard_deviations=4.0,
+                     precomputed_predictions=None, coordinate_limits=None, density_limit=None):
     """Save marginals of two original output coordinates for a fixed latent input.
 
     Contours enclose 50%, 80%, and 95% of each bivariate Gaussian's mass.
     All five members share one set of axes in each figure.
     No PCA, pooling over states, or empirical fitting is performed.
+    Precomputed [5, D] mean/std arrays avoid another forward pass in cache analysis.
+    Optional shared coordinate/density limits allow comparison across timesteps.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -55,7 +58,17 @@ def plot_fixed_input(ensemble, state, action, output_prefix, dimensions=(0, 1),
     from matplotlib.lines import Line2D
     from matplotlib.patches import Patch
 
-    mean, std, inputs = predict_fixed_input(ensemble, state, action)
+    if precomputed_predictions is None:
+        mean, std, inputs = predict_fixed_input(ensemble, state, action)
+    else:
+        mean, std = (np.asarray(value) for value in precomputed_predictions)
+        inputs = [np.asarray(value) for value in (state, action)]
+        if any(value.ndim != 1 or not np.isfinite(value).all() for value in inputs):
+            raise ValueError("Precomputed plots require singleton state and action vectors")
+        if mean.ndim != 2 or mean.shape[0] != 5 or std.shape != mean.shape:
+            raise ValueError("Precomputed predictions must have shape [5, features]")
+        if not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any():
+            raise ValueError("Invalid precomputed Gaussian parameters")
     if (len(dimensions) != 2 or len(set(dimensions)) != 2
             or any(not isinstance(d, int) or d < 0 or d >= mean.shape[-1] for d in dimensions)):
         raise ValueError("dimensions must select two distinct valid output coordinates")
@@ -64,9 +77,16 @@ def plot_fixed_input(ensemble, state, action, output_prefix, dimensions=(0, 1),
     selected_mean, selected_std = mean[:, dimensions], std[:, dimensions]
     lower = (selected_mean - standard_deviations * selected_std).min(0)
     upper = (selected_mean + standard_deviations * selected_std).max(0)
+    if coordinate_limits is not None:
+        limits = np.asarray(coordinate_limits)
+        if limits.shape != (2, 2) or not np.isfinite(limits).all() or (limits[1] <= limits[0]).any():
+            raise ValueError("coordinate_limits must be [lower_xy, upper_xy]")
+        lower, upper = limits
     x, y = np.meshgrid(*(np.linspace(lower[d], upper[d], grid_size) for d in range(2)))
     # Marginalizing a diagonal Gaussian simply selects means and variances.
     peak = 1.0 / (2.0 * np.pi * selected_std.prod(-1))
+    if density_limit is not None and (not np.isfinite(density_limit) or density_limit < peak.max()):
+        raise ValueError("density_limit must include all member peaks")
     density = peak[:, None, None] * np.exp(-0.5 * (
         ((x[None] - selected_mean[:, 0, None, None]) / selected_std[:, 0, None, None]) ** 2
         + ((y[None] - selected_mean[:, 1, None, None]) / selected_std[:, 1, None, None]) ** 2))
@@ -103,7 +123,7 @@ def plot_fixed_input(ensemble, state, action, output_prefix, dimensions=(0, 1),
                          zdir="z", offset=0, colors=[colors[member]], linewidths=1.2)
         axis.set(xlabel=xlabel, ylabel=ylabel, zlabel="Probability density",
                  xlim=(lower[0], upper[0]), ylim=(lower[1], upper[1]),
-                 zlim=(0, float(peak.max()) * 1.05))
+                 zlim=(0, density_limit if density_limit is not None else float(peak.max()) * 1.05))
         axis.view_init(elev=28, azim=-55)
         axis.legend(handles=[Patch(facecolor=color, alpha=0.35, label=f"MLP {i + 1}")
                              for i, color in enumerate(colors)], loc="upper right")
