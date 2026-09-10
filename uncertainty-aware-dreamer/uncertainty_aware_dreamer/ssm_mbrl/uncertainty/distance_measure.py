@@ -1,3 +1,10 @@
+"""Gaussian ensemble disagreement: legacy GJS/JRD, sampled JS, and mean variance.
+
+Each compute_measure accepts [members, ..., features] and returns [..., 1].
+Legacy measures retain their original arithmetic for experiment reproducibility.
+"""
+
+import math
 import torch
 
 jit = torch.jit
@@ -78,6 +85,61 @@ class GeometricJensenShannonDivergence(AbstractDistanceMeasure):
         log_term = (1 - al) * log_det_S1 + al * log_det_S2 - log_det_SSum
         shanon = 1 / 2 * (t1S + t2S - t3S + log_term)
         return shanon
+
+
+class JensenShannonDivergence(AbstractDistanceMeasure):
+    """Stratified Monte Carlo JS against the equal-weight Gaussian mixture.
+
+    num_samples is the number of samples per member and conditioning input.
+    Sampling chunks bound temporary storage; no dense covariance is constructed.
+    Estimates can be slightly negative from Monte Carlo noise; do not clamp them.
+    """
+
+    def __init__(self, num_samples: int = 32, sample_chunk_size: int = 8):
+        if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples < 1:
+            raise ValueError("num_samples must be a positive integer")
+        if isinstance(sample_chunk_size, bool) or not isinstance(sample_chunk_size, int) or sample_chunk_size < 1:
+            raise ValueError("sample_chunk_size must be a positive integer")
+        super().__init__()
+        self.num_samples = num_samples
+        self.sample_chunk_size = sample_chunk_size
+
+    @jit.script_method
+    def compute_measure(self, means: torch.Tensor, vars: torch.Tensor) -> torch.Tensor:
+        if means.shape != vars.shape or means.dim() < 2 or means.size(0) < 1:
+            raise ValueError("Expected matching [members, ..., features] tensors")
+        if not torch.isfinite(means).all() or not torch.isfinite(vars).all() or (vars <= 0).any():
+            raise ValueError("Gaussian parameters must be finite with positive variances")
+        member_count = means.size(0)
+        result = torch.zeros_like(means[0].sum(-1))
+        if member_count == 1:
+            return result.unsqueeze(-1)
+        for source in range(member_count):
+            for start in range(0, self.num_samples, self.sample_chunk_size):
+                count = min(self.sample_chunk_size, self.num_samples - start)
+                noise = torch.randn_like(means[source].unsqueeze(0).expand([count] + list(means[source].shape)))
+                samples = means[source] + vars[source].sqrt() * noise
+                # The common Gaussian normalization constant cancels in the ratio.
+                own_log_prob = -0.5 * (noise.square() + vars[source].log()).sum(-1)
+                mixture_log_prob = torch.full_like(own_log_prob, -float("inf"))
+                for target in range(member_count):
+                    log_prob = -0.5 * (((samples - means[target]).square() / vars[target]) + vars[target].log()).sum(-1)
+                    mixture_log_prob = torch.logaddexp(mixture_log_prob, log_prob)
+                result = result + (own_log_prob - mixture_log_prob + math.log(float(member_count))).sum(0)
+        return (result / float(member_count * self.num_samples)).unsqueeze(-1)
+
+
+class TransitionMeanVariance(AbstractDistanceMeasure):
+    """Mean over features of population variance across member prediction means.
+
+    Predictive variances are intentionally ignored: this is Var_member[E[Y|member]].
+    """
+
+    @jit.script_method
+    def compute_measure(self, means: torch.Tensor, vars: torch.Tensor) -> torch.Tensor:
+        if means.dim() < 2 or means.size(0) < 1:
+            raise ValueError("Expected [members, ..., features] means")
+        return means.var(dim=0, unbiased=False).mean(dim=-1, keepdim=True)
 
 
 class JensenRenyiDivergence(AbstractDistanceMeasure):

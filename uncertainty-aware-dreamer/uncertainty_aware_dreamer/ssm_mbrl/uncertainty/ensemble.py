@@ -1,3 +1,9 @@
+"""Build and train Gaussian MLP ensembles and compute configurable disagreement.
+
+EnsembleModelFactory constructs members; EnsembleModel exposes predictions,
+masked likelihood training, and GJS/JS/transition-mean-variance scoring.
+"""
+
 from typing import Tuple
 from collections import OrderedDict
 import torch
@@ -29,6 +35,9 @@ class EnsembleModelFactory:
         config.max_std = 5.0        # ignored if not sigmoid_activation
         config.sigmoid_activation = False
         config.output_normalization = "none"
+        config.distance_measure = "gjs"
+        config.js_num_samples = 32
+        config.js_sample_chunk_size = 8
         
         if finalize_adding:
             config.finalize_adding()
@@ -81,6 +90,14 @@ class EnsembleModel(nn.Module):
         if config.distance_measure == "gjs":
             from uncertainty_aware_dreamer.ssm_mbrl.uncertainty.distance_measure import GeometricJensenShannonDivergence
             self._distance_measure = GeometricJensenShannonDivergence()
+        elif config.distance_measure == "js":
+            from uncertainty_aware_dreamer.ssm_mbrl.uncertainty.distance_measure import JensenShannonDivergence
+            self._distance_measure = JensenShannonDivergence(
+                num_samples=config.get("js_num_samples", 32),
+                sample_chunk_size=config.get("js_sample_chunk_size", 8))
+        elif config.distance_measure == "transition_var":
+            from uncertainty_aware_dreamer.ssm_mbrl.uncertainty.distance_measure import TransitionMeanVariance
+            self._distance_measure = TransitionMeanVariance()
         elif config.distance_measure == "jrd":
             from uncertainty_aware_dreamer.ssm_mbrl.uncertainty.distance_measure import JensenRenyiDivergence
             self._distance_measure = JensenRenyiDivergence()

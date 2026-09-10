@@ -1,4 +1,5 @@
-# Uncertainty-aware latent imagination algorithm, utilizing the URSSM world model
+# Uncertainty-aware latent imagination with the categorical URSSM world model.
+# Configures policy training, Gaussian MLP architecture, and disagreement scoring.
 defaults:
   - li-cat_rssm
   - override world_model: cat_urssm
@@ -32,4 +33,6 @@ ensemble:
   max_std: 5.0
   sigmoid_activation: False
   output_normalization:
-  distance_measure: gjs     # gjs or jrd
+  distance_measure: gjs     # gjs, js, transition_var; legacy jrd remains supported
+  js_num_samples: 32        # Monte Carlo samples per member and state-action
+  js_sample_chunk_size: 8   # Maximum samples per temporary computation chunk
